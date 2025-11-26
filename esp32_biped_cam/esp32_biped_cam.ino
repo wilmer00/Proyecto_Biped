@@ -6,27 +6,20 @@
 #include <Adafruit_PWMServoDriver.h>
 #include <ArduinoJson.h>
 
-// ==================== ✅ CONFIGURACIÓN WIFI (TU MÓVIL) ====================
-#define WIFI_SSID "Redmi"          // Nombre de tu hotspot
-#define WIFI_PASSWORD "qwerty123" // Contraseña de tu hotspot
+// ==================== CONFIGURACIÓN WIFI ====================
+#define WIFI_SSID "Redmi"
+#define WIFI_PASSWORD "qwerty123"
 
 // ==================== CONFIGURACIÓN HARDWARE ====================
 #define I2C_SDA 13
 #define I2C_SCL 12
 #define PCA9685_ADDR 0x40
 #define LED_PIN 2
+#define PIN_OE 15
 
 // Dimensiones de las piernas (en mm)
-#define L1 45.0  // Longitud del fémur
-#define L2 55.0  // Longitud de la tibia
-
-// Offsets para calibración
-#define LEFT_HIP_OFFSET    0
-#define RIGHT_HIP_OFFSET   0
-#define LEFT_KNEE_OFFSET   0
-#define RIGHT_KNEE_OFFSET  0
-#define LEFT_FOOT_OFFSET   0
-#define RIGHT_FOOT_OFFSET  0
+#define L1 45.0
+#define L2 55.0
 
 // Parámetros de marcha
 #define STEP_CLEARANCE 20
@@ -61,21 +54,25 @@ enum Mode { MODE_IDLE, MODE_WALK, MODE_MANUAL };
 Mode currentMode = MODE_IDLE;
 unsigned long lastStepTime = 0;
 int servoAngles[6] = {90, 90, 90, 90, 90, 90};
+bool servosEnabled = true;
 
 // ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n🤖 Iniciando Bípedo ESP32-S...");
+  Serial.println("\n🤖 Iniciando Bípedo ESP32-S con control mejorado...");
   Serial.print("Conectando a WiFi: ");
   Serial.println(WIFI_SSID);
   
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+  pinMode(PIN_OE, OUTPUT);
+  digitalWrite(PIN_OE, LOW);
   
   // Inicializar PCA9685
   Wire.begin(I2C_SDA, I2C_SCL);
   pca.begin();
   pca.setPWMFreq(50);
+  delay(100);
   
   // Inicializar cámara
   if (!initCamera()) {
@@ -86,27 +83,44 @@ void setup() {
     }
   }
   
-  // ✅ MODO STATION: Se conecta al hotspot del móvil
+  // Conectar WiFi
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
     delay(500);
     Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n❌ No se pudo conectar al WiFi");
+    Serial.println("Verifica SSID y contraseña");
+    while(1) delay(1000);
   }
   
   Serial.println("\n✅ Conectado al WiFi!");
-  Serial.print("IP del ESP32: ");
+  Serial.print("📍 IP del ESP32: ");
   Serial.println(WiFi.localIP());
+  Serial.print("📹 Stream de video: http://");
+  Serial.println(WiFi.localIP());
+  Serial.print("🔌 WebSocket: ws://");
+  Serial.print(WiFi.localIP());
+  Serial.println(":82");
   
-  // Configurar servidor HTTP (video) y WebSocket (control)
+  // Configurar servidor HTTP y WebSocket
   server.on("/", handleRoot);
   server.on("/status", handleStatus);
+  server.onNotFound(handleNotFound);
   server.begin();
   
   webSocket.begin();
   webSocket.onEvent(handleWebSocketEvent);
   
+  // Posición inicial
   standStraight();
   delay(500);
+  
+  Serial.println("✅ Sistema listo para recibir comandos");
 }
 
 // ==================== INICIALIZACIÓN DE CÁMARA ====================
@@ -133,9 +147,9 @@ bool initCamera() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   
-  config.xclk_freq_hz = 10000000;      // 10MHz para estabilidad
+  config.xclk_freq_hz = 10000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_QVGA;  // 320x240
+  config.frame_size = FRAMESIZE_QVGA;
   config.jpeg_quality = 20;
   config.fb_count = 1;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
@@ -158,10 +172,22 @@ void loop() {
   
   if (currentMode == MODE_WALK) walkCycle();
   
+  // Enviar estado cada 200ms
   static unsigned long lastStatus = 0;
-  if (millis() - lastStatus > 500) {
+  if (millis() - lastStatus > 200) {
     sendStatus();
     lastStatus = millis();
+  }
+  
+  // LED parpadeante si hay clientes conectados
+  static unsigned long lastBlink = 0;
+  if (webSocket.connectedClients() > 0) {
+    if (millis() - lastBlink > 500) {
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      lastBlink = millis();
+    }
+  } else {
+    digitalWrite(LED_PIN, LOW);
   }
 }
 
@@ -174,11 +200,11 @@ void walkCycle() {
   if (phase > 1.0) phase = 0.0;
   
   if (phase < 0.5) {
-    moveLeg(0, phase * 2.0);  // Pierna izquierda
-    holdLeg(3);                // Pierna derecha fija
+    moveLeg(0, phase * 2.0);
+    holdLeg(3);
   } else {
-    moveLeg(3, (phase - 0.5) * 2.0);  // Pierna derecha
-    holdLeg(0);                        // Pierna izquierda fija
+    moveLeg(3, (phase - 0.5) * 2.0);
+    holdLeg(0);
   }
 }
 
@@ -188,7 +214,6 @@ void moveLeg(int baseChannel, float progress) {
   float r = sqrt(x*x + z*z);
   float gamma = atan2(z, x);
   
-  // ✅ CORREGIDO: L1 y L2 están definidos arriba
   float cos_knee = constrain((L1*L1 + L2*L2 - r*r) / (2*L1*L2), -1.0, 1.0);
   float knee = acos(cos_knee) * 180.0 / PI;
   float alpha = asin((L2 * sin(acos(cos_knee))) / r) * 180.0 / PI;
@@ -208,13 +233,41 @@ void holdLeg(int baseChannel) {
 
 void standStraight() {
   for (int i = 0; i < 6; i++) setServo(i, 90);
+  Serial.println("📏 Posición: De pie recto (90° todos)");
 }
 
 void setServo(int channel, int angle) {
+  if (channel < 0 || channel > 5) return;
   angle = constrain(angle, 0, 180);
   servoAngles[channel] = angle;
-  int pulse = map(angle, 0, 180, 150, 600);
-  pca.setPWM(channel, 0, pulse);
+  
+  if (servosEnabled) {
+    int pulse = map(angle, 0, 180, 150, 600);
+    pca.setPWM(channel, 0, pulse);
+  }
+}
+
+// ✅ Comando para mover todos los servos a la vez
+void setAllServos(int angles[6]) {
+  Serial.print("📐 Moviendo todos los servos: [");
+  for (int i = 0; i < 6; i++) {
+    setServo(i, angles[i]);
+    Serial.print(angles[i]);
+    if (i < 5) Serial.print(", ");
+  }
+  Serial.println("]");
+}
+
+void disableServos() {
+  digitalWrite(PIN_OE, HIGH);
+  servosEnabled = false;
+  Serial.println("🔒 Servos DESHABILITADOS (sin torque)");
+}
+
+void enableServos() {
+  digitalWrite(PIN_OE, LOW);
+  servosEnabled = true;
+  Serial.println("🔓 Servos HABILITADOS");
 }
 
 // ==================== WEBSOCKET ====================
@@ -222,54 +275,118 @@ void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t l
   switch (type) {
     case WStype_DISCONNECTED:
       Serial.printf("❌ Cliente %u desconectado\n", num);
-      digitalWrite(LED_PIN, LOW);
+      if (webSocket.connectedClients() == 0) {
+        currentMode = MODE_IDLE;
+        standStraight();
+      }
       break;
-    case WStype_CONNECTED:
-      Serial.printf("✅ Cliente %u conectado\n", num);
-      digitalWrite(LED_PIN, HIGH);
+      
+    case WStype_CONNECTED: {
+      IPAddress ip = webSocket.remoteIP(num);
+      Serial.printf("✅ Cliente %u conectado desde %d.%d.%d.%d\n", 
+                    num, ip[0], ip[1], ip[2], ip[3]);
+      // Enviar estado inicial inmediatamente
+      sendStatus();
       break;
+    }
+    
     case WStype_TEXT: {
       String message = String((char*)payload);
-      DynamicJsonDocument doc(128);
-      deserializeJson(doc, message);
+      DynamicJsonDocument doc(512);
+      DeserializationError error = deserializeJson(doc, message);
+      
+      if (error) {
+        Serial.print("❌ Error JSON: ");
+        Serial.println(error.c_str());
+        return;
+      }
+      
       String cmd = doc["cmd"];
+      Serial.print("📥 Comando recibido: ");
+      Serial.println(cmd);
       
       if (cmd == "set_mode") {
         String mode = doc["mode"];
-        if (mode == "walk") currentMode = MODE_WALK;
-        else if (mode == "manual") currentMode = MODE_MANUAL;
-        else currentMode = MODE_IDLE;
-        standStraight();
-      } else if (cmd == "set_servo") {
-        if (currentMode == MODE_MANUAL) {
-          setServo(doc["id"], doc["angle"]);
+        if (mode == "walk") {
+          currentMode = MODE_WALK;
+          lastStepTime = millis();
+          Serial.println("🚶 Modo: CAMINAR");
+        } else if (mode == "manual") {
+          currentMode = MODE_MANUAL;
+          Serial.println("🎮 Modo: CONTROL MANUAL");
+        } else {
+          currentMode = MODE_IDLE;
+          standStraight();
+          Serial.println("⏸️  Modo: IDLE (detenido)");
         }
+      } 
+      else if (cmd == "set_servo") {
+        if (currentMode == MODE_MANUAL) {
+          int id = doc["id"];
+          int angle = doc["angle"];
+          setServo(id, angle);
+          Serial.printf("🎯 Servo %d → %d°\n", id, angle);
+        }
+      }
+      else if (cmd == "set_all_servos") {
+        if (currentMode == MODE_MANUAL) {
+          JsonArray angles = doc["angles"];
+          if (angles.size() == 6) {
+            int servoVals[6];
+            for (int i = 0; i < 6; i++) {
+              servoVals[i] = angles[i];
+            }
+            setAllServos(servoVals);
+          }
+        }
+      }
+      else if (cmd == "disable_servos") {
+        disableServos();
+      }
+      else if (cmd == "enable_servos") {
+        enableServos();
+      }
+      else if (cmd == "stand") {
+        currentMode = MODE_IDLE;
+        standStraight();
+      }
+      else if (cmd == "get_status") {
+        sendStatus();
+      }
+      else {
+        Serial.println("⚠️  Comando desconocido");
       }
       break;
     }
-    default: break;
+    
+    default: 
+      break;
   }
 }
 
 void sendStatus() {
   if (webSocket.connectedClients() < 1) return;
   
-  String json = "{";
-  json += "\"mode\":\"" + String(currentMode == MODE_IDLE ? "idle" : 
-                                 currentMode == MODE_WALK ? "walk" : "manual") + "\",";
-  json += "\"servos\":[" + String(servoAngles[0]) + ",";
-  json += String(servoAngles[1]) + "," + String(servoAngles[2]) + ",";
-  json += String(servoAngles[3]) + "," + String(servoAngles[4]) + ",";
-  json += String(servoAngles[5]) + "]";
-  json += "}";
-  webSocket.broadcastTXT(json);
+  DynamicJsonDocument doc(256);
+  doc["mode"] = (currentMode == MODE_IDLE ? "idle" : 
+                 currentMode == MODE_WALK ? "walk" : "manual");
+  doc["servos_enabled"] = servosEnabled;
+  doc["uptime"] = millis() / 1000;
+  
+  JsonArray servos = doc.createNestedArray("servos");
+  for (int i = 0; i < 6; i++) {
+    servos.add(servoAngles[i]);
+  }
+  
+  String output;
+  serializeJson(doc, output);
+  webSocket.broadcastTXT(output);
 }
 
 // ==================== HTTP VIDEO STREAM ====================
 void handleRoot() {
   WiFiClient client = server.client();
   
-  // Encabezados HTTP para video streaming
   String response = "HTTP/1.1 200 OK\r\n";
   response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n";
   response += "Cache-Control: no-cache, no-store, must-revalidate\r\n";
@@ -284,8 +401,8 @@ void handleRoot() {
   while (client.connected()) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
-      Serial.println("Error obteniendo frame");
-      delay(10);  // ✅ CORREGIDO: delay() en lugar de time.sleep()
+      Serial.println("⚠️  Error obteniendo frame");
+      delay(10);
       continue;
     }
     
@@ -298,17 +415,26 @@ void handleRoot() {
     client.write("\r\n", 2);
     
     esp_camera_fb_return(fb);
-    yield(); // Para evitar watchdog
+    yield();
   }
   
   Serial.println("📹 Cliente de video desconectado");
 }
 
 void handleStatus() {
-  String json = "{\"status\":\"ok\",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
-  server.send(200, "application/json", json);
+  DynamicJsonDocument doc(256);
+  doc["status"] = "ok";
+  doc["ip"] = WiFi.localIP().toString();
+  doc["mode"] = (currentMode == MODE_IDLE ? "idle" : 
+                 currentMode == MODE_WALK ? "walk" : "manual");
+  doc["clients"] = webSocket.connectedClients();
+  doc["uptime"] = millis() / 1000;
+  
+  String output;
+  serializeJson(doc, output);
+  server.send(200, "application/json", output);
 }
 
 void handleNotFound() {
-  server.send(404, "text/plain", "Not Found");
+  server.send(404, "text/plain", "404: Ruta no encontrada");
 }
