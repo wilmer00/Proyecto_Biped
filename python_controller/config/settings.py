@@ -3,7 +3,7 @@ Configuración global del sistema
 """
 
 class Config:
-    SIMULATION_MODE = False # False para usar ESP32 real
+    SIMULATION_MODE = True # False para usar ESP32 real
     
     # ESP32 Connection
     ESP32_IP = "10.181.145.31"
