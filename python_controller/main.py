@@ -1,282 +1,149 @@
-#!/usr/bin/env python3
-"""
-Sistema de Control de Robot Bípedo
-Incluye: Control de hardware, Simulación, IA, Visualización 3D
-"""
-import sys
-import os
+from flask import Flask, jsonify, request, Response
+from flask_cors import CORS
+import json
 import time
-from PyQt5.QtWidgets import QApplication, QMessageBox, QProgressDialog
-from PyQt5.QtCore import Qt
+from threading import Lock
+import random
 
-# Importar módulos del proyecto
-from config.settings import Config
-from hardware.esp32_camera import ESP32Camera
-from hardware.esp32_websocket import ESP32WebSocket
-from simulation.virtual_esp32 import VirtualESP32
-from kinematics.leg_controller import LegController
-from ai.mineral_detector import MineralDetector
-from ui.main_window import MainWindow
+app = Flask(__name__)
+CORS(app)
 
+# Estado global de los servos (6 servos)
+servo_state = {
+    'servo1': {'angle': 90, 'kp': 1.0, 'ki': 0.0, 'kd': 0.0},
+    'servo2': {'angle': 90, 'kp': 1.0, 'ki': 0.0, 'kd': 0.0},
+    'servo3': {'angle': 90, 'kp': 1.0, 'ki': 0.0, 'kd': 0.0},
+    'servo4': {'angle': 90, 'kp': 1.0, 'ki': 0.0, 'kd': 0.0},
+    'servo5': {'angle': 90, 'kp': 1.0, 'ki': 0.0, 'kd': 0.0},
+    'servo6': {'angle': 90, 'kp': 1.0, 'ki': 0.0, 'kd': 0.0}
+}
 
-class RobotController:
-    """Controlador principal que unifica hardware y simulación"""
+# Variables para la cámara WebSocket
+camera_available = False
+camera_url = "ws://localhost:8765"  # URL del WebSocket de Python
+
+state_lock = Lock()
+
+# Endpoint para obtener el estado de todos los servos
+@app.route('/api/servos', methods=['GET'])
+def get_servos():
+    with state_lock:
+        return jsonify(servo_state)
+
+# Endpoint para actualizar un servo específico
+@app.route('/api/servo/<servo_id>', methods=['POST'])
+def update_servo(servo_id):
+    if servo_id not in servo_state:
+        return jsonify({'error': 'Servo no encontrado'}), 404
     
-    def __init__(self, simulation_mode=True):
-        self.simulation_mode = simulation_mode
-        
-        if simulation_mode:
-            print("🤖 Iniciando en MODO SIMULACIÓN")
-            self.virtual_esp32 = VirtualESP32()
-            self.camera = None
-            self.websocket = None
-        else:
-            print("🔌 Iniciando en MODO HARDWARE REAL")
-            self.virtual_esp32 = None
-            self.camera = ESP32Camera()
-            self.websocket = ESP32WebSocket()
-            
-    def start(self):
-        """Iniciar todos los componentes"""
-        if self.simulation_mode:
-            self.virtual_esp32.start()
-        else:
-            self.camera.start()
-            self.websocket.start()
-            
-            # Esperar conexión
-            print("Esperando conexión con ESP32...")
-            for _ in range(10):
-                time.sleep(0.5)
-                if self.camera.is_connected() or self.websocket.is_connected():
-                    break
-                    
-    def stop(self):
-        """Detener todos los componentes"""
-        if self.simulation_mode:
-            if self.virtual_esp32:
-                self.virtual_esp32.stop()
-        else:
-            if self.camera:
-                self.camera.stop()
-            if self.websocket:
-                self.websocket.stop()
-                
-    def get_frame(self):
-        """Obtener frame de la cámara"""
-        if self.simulation_mode:
-            return self.virtual_esp32.get_frame()
-        else:
-            return self.camera.get_frame() if self.camera else None
-            
-    def set_mode(self, mode):
-        """Cambiar modo de operación"""
-        if self.simulation_mode:
-            return self.virtual_esp32.set_mode(mode)
-        else:
-            return self.websocket.set_mode(mode) if self.websocket else False
-            
-    def set_servo(self, servo_id, angle):
-        """Mover un servo"""
-        if self.simulation_mode:
-            return self.virtual_esp32.set_servo(servo_id, angle)
-        else:
-            return self.websocket.set_servo(servo_id, angle) if self.websocket else False
-            
-    def set_all_servos(self, angles):
-        """Mover todos los servos"""
-        if self.simulation_mode:
-            return self.virtual_esp32.set_all_servos(angles)
-        else:
-            return self.websocket.set_all_servos(angles) if self.websocket else False
-            
-    def get_state(self):
-        """Obtener estado actual"""
-        if self.simulation_mode:
-            state = self.virtual_esp32.get_state()
-            state['connected'] = True
-            return state
-        else:
-            if self.websocket:
-                return self.websocket.get_state()
-            return {
-                'connected': False,
-                'mode': 'idle',
-                'servo_angles': [90] * 6,
-                'sensor_data': {}
-            }
-            
-    def get_mode(self):
-        """Obtener modo actual"""
-        state = self.get_state()
-        return state.get('mode', 'idle')
-
-
-def check_dependencies():
-    """Verificar que todas las dependencias estén instaladas"""
-    missing = []
+    data = request.json
+    with state_lock:
+        if 'angle' in data:
+            servo_state[servo_id]['angle'] = max(0, min(180, data['angle']))
+        if 'kp' in data:
+            servo_state[servo_id]['kp'] = data['kp']
+        if 'ki' in data:
+            servo_state[servo_id]['ki'] = data['ki']
+        if 'kd' in data:
+            servo_state[servo_id]['kd'] = data['kd']
     
-    try:
-        import cv2
-    except ImportError:
-        missing.append("opencv-python")
-        
-    try:
-        import numpy
-    except ImportError:
-        missing.append("numpy")
-        
-    try:
-        from PyQt5 import QtWidgets
-    except ImportError:
-        missing.append("PyQt5")
-        
-    try:
-        from OpenGL import GL
-    except ImportError:
-        missing.append("pyopengl")
-        
-    try:
-        import tensorflow
-    except ImportError:
-        missing.append("tensorflow")
-        
-    try:
-        import websocket
-    except ImportError:
-        missing.append("websocket-client")
-        
-    if missing:
-        print("❌ Dependencias faltantes:")
-        for dep in missing:
-            print(f"   - {dep}")
-        print("\nInstala con: pip install " + " ".join(missing))
-        return False
-        
-    print("✅ Todas las dependencias instaladas")
-    return True
+    return jsonify(servo_state[servo_id])
 
-
-def setup_directories():
-    """Crear directorios necesarios"""
-    directories = ['models', 'datasets', 'logs']
-    for d in directories:
-        os.makedirs(d, exist_ok=True)
-        
-    # Verificar dataset
-    if not os.path.exists(Config.DATASET_PATH):
-        print(f"⚠️ Carpeta de dataset no encontrada: {Config.DATASET_PATH}")
-        print("   Crea carpetas en 'datasets/' con imágenes de minerales")
-    else:
-        subdirs = [d for d in os.listdir(Config.DATASET_PATH) 
-                   if os.path.isdir(os.path.join(Config.DATASET_PATH, d))]
-        if subdirs:
-            print(f"✅ Dataset encontrado: {len(subdirs)} clases")
-        else:
-            print("⚠️ Dataset vacío")
-
-
-def main():
-    """Función principal"""
-    print("="*60)
-    print("ROBOT BÍPEDO - SISTEMA DE CONTROL COMPLETO")
-    print("="*60)
-    print()
+# Endpoint para actualizar múltiples servos (movimiento de piernas)
+@app.route('/api/servos/batch', methods=['POST'])
+def update_servos_batch():
+    data = request.json
+    with state_lock:
+        for servo_id, values in data.items():
+            if servo_id in servo_state:
+                if 'angle' in values:
+                    servo_state[servo_id]['angle'] = max(0, min(180, values['angle']))
+                if 'kp' in values:
+                    servo_state[servo_id]['kp'] = values['kp']
+                if 'ki' in values:
+                    servo_state[servo_id]['ki'] = values['ki']
+                if 'kd' in values:
+                    servo_state[servo_id]['kd'] = values['kd']
     
-    # Verificar dependencias
-    if not check_dependencies():
-        sys.exit(1)
-        
-    # Crear directorios
-    setup_directories()
-    
-    # Crear aplicación Qt
-    app = QApplication(sys.argv)
-    app.setStyle('Fusion')
-    
-    # Splash screen de carga
-    splash_msg = QProgressDialog("Iniciando sistema...", None, 0, 4)
-    splash_msg.setWindowTitle("Cargando")
-    splash_msg.setWindowModality(Qt.WindowModal)
-    splash_msg.show()
-    app.processEvents()
-    
-    try:
-        # Paso 1: Inicializar controlador
-        splash_msg.setValue(1)
-        splash_msg.setLabelText("Inicializando controlador...")
-        app.processEvents()
-        
-        controller = RobotController(simulation_mode=Config.SIMULATION_MODE)
-        controller.start()
-        time.sleep(0.5)
-        
-        # Paso 2: Inicializar cinemática
-        splash_msg.setValue(2)
-        splash_msg.setLabelText("Configurando cinemática...")
-        app.processEvents()
-        
-        leg_controller = LegController()
-        time.sleep(0.3)
-        
-        # Paso 3: Cargar modelo de IA
-        splash_msg.setValue(3)
-        splash_msg.setLabelText("Cargando detector de minerales...")
-        app.processEvents()
-        
-        mineral_detector = MineralDetector()
-        
-        # Intentar cargar modelo existente
-        if os.path.exists(Config.MODEL_PATH):
-            mineral_detector.load_model()
-        else:
-            print("⚠️ Modelo no encontrado. Entrena con: python -m ai.model_trainer")
-        
-        time.sleep(0.3)
-        
-        # Paso 4: Crear interfaz
-        splash_msg.setValue(4)
-        splash_msg.setLabelText("Creando interfaz gráfica...")
-        app.processEvents()
-        
-        window = MainWindow(controller, leg_controller, mineral_detector)
-        window.show()
-        
-        splash_msg.close()
-        
-        print()
-        print("="*60)
-        print("✅ SISTEMA LISTO")
-        print("="*60)
-        print(f"Modo: {'SIMULACIÓN' if Config.SIMULATION_MODE else 'HARDWARE REAL'}")
-        print(f"Servos: {Config.NUM_SERVOS}")
-        print(f"Modelo IA: {'Cargado' if mineral_detector.is_trained else 'No disponible'}")
-        print()
-        print("Controles:")
-        print("  - Usa los botones para cambiar modo")
-        print("  - Arrastra sliders para controlar servos (modo MANUAL)")
-        print("  - Click derecho en vista 3D para rotar")
-        print("  - Rueda del mouse para zoom")
-        print("="*60)
-        
-        # Ejecutar aplicación
-        sys.exit(app.exec_())
-        
-    except Exception as e:
-        splash_msg.close()
-        QMessageBox.critical(None, "Error", f"Error al iniciar: {str(e)}")
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-        
-    finally:
-        # Limpiar
-        try:
-            controller.stop()
-        except:
-            pass
+    return jsonify(servo_state)
 
+# Comando de movimiento (W, S, A, D, etc.)
+@app.route('/api/command', methods=['POST'])
+def command():
+    data = request.json
+    cmd = data.get('command', '').upper()
+    
+    # Simular movimientos de piernas según el comando
+    movements = {
+        'W': {  # Avanzar
+            'servo1': {'angle': 110}, 'servo2': {'angle': 70},
+            'servo3': {'angle': 100}, 'servo4': {'angle': 80},
+            'servo5': {'angle': 95}, 'servo6': {'angle': 85}
+        },
+        'S': {  # Retroceder
+            'servo1': {'angle': 70}, 'servo2': {'angle': 110},
+            'servo3': {'angle': 80}, 'servo4': {'angle': 100},
+            'servo5': {'angle': 85}, 'servo6': {'angle': 95}
+        },
+        'A': {  # Izquierda
+            'servo1': {'angle': 100}, 'servo2': {'angle': 100},
+            'servo3': {'angle': 80}, 'servo4': {'angle': 80},
+            'servo5': {'angle': 90}, 'servo6': {'angle': 90}
+        },
+        'D': {  # Derecha
+            'servo1': {'angle': 80}, 'servo2': {'angle': 80},
+            'servo3': {'angle': 100}, 'servo4': {'angle': 100},
+            'servo5': {'angle': 90}, 'servo6': {'angle': 90}
+        },
+        'STOP': {  # Detener
+            'servo1': {'angle': 90}, 'servo2': {'angle': 90},
+            'servo3': {'angle': 90}, 'servo4': {'angle': 90},
+            'servo5': {'angle': 90}, 'servo6': {'angle': 90}
+        }
+    }
+    
+    if cmd in movements:
+        with state_lock:
+            for servo_id, values in movements[cmd].items():
+                servo_state[servo_id].update(values)
+        return jsonify({'status': 'ok', 'command': cmd, 'servos': servo_state})
+    
+    return jsonify({'error': 'Comando no válido'}), 400
 
-if __name__ == "__main__":
-    main()
+# Endpoint para obtener datos de telemetría (para gráficas)
+@app.route('/api/telemetry', methods=['GET'])
+def get_telemetry():
+    # Datos simulados para las gráficas
+    telemetry = {
+        'timestamp': time.time(),
+        'angles': [servo_state[f'servo{i}']['angle'] for i in range(1, 7)],
+        'errors': [random.uniform(-5, 5) for _ in range(6)],
+        'pwm': [random.randint(1000, 2000) for _ in range(6)]
+    }
+    return jsonify(telemetry)
+
+# Endpoint para verificar disponibilidad de cámara WebSocket
+@app.route('/api/camera/status', methods=['GET'])
+def camera_status():
+    return jsonify({
+        'available': camera_available,
+        'url': camera_url if camera_available else None
+    })
+
+# Server-Sent Events para streaming de datos en tiempo real
+@app.route('/api/stream')
+def stream():
+    def generate():
+        while True:
+            with state_lock:
+                data = {
+                    'servos': servo_state,
+                    'timestamp': time.time()
+                }
+            yield f"data: {json.dumps(data)}\n\n"
+            time.sleep(0.1)  # 10Hz
+    
+    return Response(generate(), mimetype='text/event-stream')
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
